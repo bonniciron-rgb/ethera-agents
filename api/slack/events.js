@@ -57,19 +57,34 @@ async function runTool(name, input) {
 
 async function think(system, prompt) {
   const messages = [{ role: "user", content: prompt || "Introduce yourself to the team." }];
-  for (let i = 0; i < 6; i++) {
+  let lastError = null;
+  const MAX = 10;
+  for (let i = 0; i < MAX; i++) {
     const r = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 1500, system, tools: TOOLS, messages });
     const toolUses = r.content.filter((c) => c.type === "tool_use");
-    if (toolUses.length === 0) return r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") || "(no reply)";
+    if (toolUses.length === 0) {
+      return r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") || "(no reply)";
+    }
     messages.push({ role: "assistant", content: r.content });
     const results = [];
     for (const tu of toolUses) {
-      let out; try { out = await runTool(tu.name, tu.input); } catch (e) { out = "Error: " + e.message; }
+      let out;
+      try { out = await runTool(tu.name, tu.input); }
+      catch (e) { out = "Error: " + e.message; lastError = `${tu.name} → ${e.message}`; }
       results.push({ type: "tool_result", tool_use_id: tu.id, content: String(out).slice(0, 6000) });
     }
     messages.push({ role: "user", content: results });
   }
-  return "(stopped after max tool iterations)";
+  // Tool budget hit — force a final text answer (no tools) from what it has
+  try {
+    const r = await anthropic.messages.create({
+      model: "claude-sonnet-4-6", max_tokens: 1000, system, tools: TOOLS,
+      tool_choice: { type: "none" }, messages,
+    });
+    const text = r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    if (text) return text + (lastError ? `\n\n_(tool note: ${lastError})_` : "");
+  } catch (_) {}
+  return `I couldn't finish within my tool budget.${lastError ? ` Last tool error: ${lastError}` : " No tool errors logged — try a narrower request."}`;
 }
 
 function pickRole(text) { const t = (text || "").toUpperCase(); if (t.includes("[PM]")) return ROLES.PM; if (t.includes("[PA]")) return ROLES.PA; return DEFAULT; }
