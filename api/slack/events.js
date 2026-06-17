@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
+import { loadCursor, saveCursor, fetchChannelHistory, formatHistoryForPrompt } from "../../lib/memory.js";
 
 // ─── Identity + scope ──────────────────────────────────────────────────────
 const BOT_USER_ID = process.env.BOT_SLACK_USER_ID || "U0B8R5AQRTL";
@@ -168,11 +169,22 @@ export default async function handler(req, res) {
   const triggeredByRon = RON_USER_ID && event.user === RON_USER_ID;
   if (event.type === "message" && !isOwn && mentionsBot && triggeredByRon) {
     const role = pickRole(event.text);
-    const prompt = event.text
+    const ask = event.text
       .replace(new RegExp(`<@${BOT_USER_ID}>`, "g"), "")
       .replace(/\[(PM|PA)\]/gi, "")
       .trim();
+
+    // Ground on #panpm history since last cursor (fail-open).
+    const cursor = await loadCursor(event.channel);
+    const history = await fetchChannelHistory(event.channel, cursor);
+    const ctx = formatHistoryForPrompt(history);
+    const prompt = ctx
+      ? `Recent #panpm activity (chronological):\n${ctx}\n\n---\nRon just asked:\n${ask}`
+      : ask;
+
     const reply = await think(role.system, prompt);
+    // Advance cursor so next invocation only sees newer messages.
+    if (event.ts) await saveCursor(event.channel, event.ts);
     // CSO protocol: TOP-LEVEL posts only, never in thread. Output tagged
     // [ROLE] -> [Ron]: <topic> on the first line so threads-of-threads
     // can't accidentally form.
