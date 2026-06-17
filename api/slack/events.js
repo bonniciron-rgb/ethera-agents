@@ -16,8 +16,10 @@ const AUTH = "Basic " + Buffer.from(`${process.env.CONFLUENCE_EMAIL}:${process.e
 const SHARED = `You operate in the Lucida Origem / OnPoint team Slack (#panpm). Brands: Step Up Idiomas, CasaMinder, Ethera. You can read and write the Lucida Origem (LO) Confluence space via your confluence_* tools — the live sprint/strategy board is page 220364812 and the 30-day strategy is page 223608837. Read the board for current context before answering when relevant. Reply concisely, Slack-style. Coordination protocol: post TOP-LEVEL only (never threads), tag every reply as "[ROLE] -> [TO]: <topic>". You may draft, plan, analyse, and update LO Confluence (reversible). Never claim to have published externally, deployed to prod, sent client messages, or spent money — those need Ron's ✅. One step at a time.`;
 
 const ROLES = {
-  PM: { label: "PM",    system: `You are the PM agent — sprint/project management. ${SHARED} Focus: sprint coordination, MoSCoW priorities (P0→P3), blockers, keeping the board (220364812) current.` },
-  PA: { label: "PA",    system: `You are the PA agent — assistant & ops support. ${SHARED} Focus: briefs, report analysis (SEO/GA4), specs, scheduling, compliance (Step Up off-peak price never public).` },
+  PM: { label: "PM", briefPageId: "229474306", system: `You are the PM agent — sprint/project management. ${SHARED} Focus: sprint coordination, MoSCoW priorities (P0→P3), blockers, keeping the board (220364812) current.` },
+  PA: { label: "PA", system: `You are the PA agent — assistant & ops support. ${SHARED} Focus: briefs, report analysis (SEO/GA4), specs, scheduling, compliance (Step Up off-peak price never public).` },
+  MK: { label: "MK", briefPageId: "229507074", system: `You are the Marketing/Content agent. ${SHARED} Focus: campaign briefs, content calendars, copy drafts (EN/PT), channel mix across Step Up / CasaMinder / Ethera.` },
+  DS: { label: "DS", briefPageId: "229539841", system: `You are the Design agent. ${SHARED} Focus: visual direction, brand consistency across the three brands, asset specs, design QA notes.` },
 };
 const DEFAULT = { label: "ethera-agents", system: `You are ethera-agents, the team ops assistant. ${SHARED}` };
 
@@ -97,7 +99,27 @@ function pickRole(text) {
   const t = (text || "").toUpperCase();
   if (t.includes("[PM]")) return { ...ROLES.PM, key: "PM" };
   if (t.includes("[PA]")) return { ...ROLES.PA, key: "PA" };
+  if (t.includes("[MK]")) return { ...ROLES.MK, key: "MK" };
+  if (t.includes("[DS]")) return { ...ROLES.DS, key: "DS" };
   return { ...DEFAULT, key: "AGENT" };
+}
+
+// Confluence persona briefs — fetched once per cold start, cached in module
+// memory. Fail-open: if the brief can't load, the role still runs on its
+// inline system prompt.
+const BRIEF_CACHE = new Map();
+async function loadBrief(pageId) {
+  if (!pageId) return "";
+  if (BRIEF_CACHE.has(pageId)) return BRIEF_CACHE.get(pageId);
+  try {
+    const d = await conf(`/rest/api/content/${pageId}?expand=body.storage`);
+    const text = stripHtml(d.body?.storage?.value);
+    BRIEF_CACHE.set(pageId, text);
+    return text;
+  } catch {
+    BRIEF_CACHE.set(pageId, "");
+    return "";
+  }
 }
 
 // ─── Vercel raw-body read for Slack signature verification ─────────────────
@@ -182,7 +204,9 @@ export default async function handler(req, res) {
       ? `Recent #panpm activity (chronological):\n${ctx}\n\n---\nRon just asked:\n${ask}`
       : ask;
 
-    const reply = await think(role.system, prompt);
+    const brief = await loadBrief(role.briefPageId);
+    const system = brief ? `${role.system}\n\n--- Persona brief (Confluence ${role.briefPageId}) ---\n${brief}` : role.system;
+    const reply = await think(system, prompt);
     // Advance cursor so next invocation only sees newer messages.
     if (event.ts) await saveCursor(event.channel, event.ts);
     // CSO protocol: TOP-LEVEL posts only, never in thread. Output tagged
