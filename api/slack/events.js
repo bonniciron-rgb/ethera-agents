@@ -1,25 +1,30 @@
+import crypto from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 
-const BOT_USER_ID = "U0B8R5AQRTL";
+// ─── Identity + scope ──────────────────────────────────────────────────────
+const BOT_USER_ID = process.env.BOT_SLACK_USER_ID || "U0B8R5AQRTL";
+const RON_USER_ID = process.env.RON_SLACK_USER_ID || "";           // Step 1: trigger gate
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || ""; // Step 1: signature verify
 const SPACE_KEY = "LLO"; // Lucida Origem
+
 const anthropic = new Anthropic();
 
 const CONF = process.env.CONFLUENCE_BASE_URL; // https://ronbonnici.atlassian.net/wiki
 const AUTH = "Basic " + Buffer.from(`${process.env.CONFLUENCE_EMAIL}:${process.env.CONFLUENCE_API_TOKEN}`).toString("base64");
 
-const SHARED = `You operate in the Lucida Origem / OnPoint team Slack (#panpm). Brands: Step Up Idiomas, CasaMinder, Ethera. You can read and write the Lucida Origem (LO) Confluence space via your confluence_* tools — the live sprint/strategy board is page 220364812 and the 30-day strategy is page 223608837. Read the board for current context before answering when relevant. Reply concisely, Slack-style. You may draft, plan, analyse, and update LO Confluence (reversible). Never claim to have published externally, deployed to prod, sent client messages, or spent money — those need Ron's ✅. One step at a time.`;
+const SHARED = `You operate in the Lucida Origem / OnPoint team Slack (#panpm). Brands: Step Up Idiomas, CasaMinder, Ethera. You can read and write the Lucida Origem (LO) Confluence space via your confluence_* tools — the live sprint/strategy board is page 220364812 and the 30-day strategy is page 223608837. Read the board for current context before answering when relevant. Reply concisely, Slack-style. Coordination protocol: post TOP-LEVEL only (never threads), tag every reply as "[ROLE] -> [TO]: <topic>". You may draft, plan, analyse, and update LO Confluence (reversible). Never claim to have published externally, deployed to prod, sent client messages, or spent money — those need Ron's ✅. One step at a time.`;
 
 const ROLES = {
-  PM: { label: "PM 🤖", system: `You are the PM agent — sprint/project management. ${SHARED} Focus: sprint coordination, MoSCoW priorities (P0→P3), blockers, keeping the board (220364812) current. Sign "— PM 🤖".` },
-  PA: { label: "PA", system: `You are the PA agent — assistant & ops support. ${SHARED} Focus: briefs, report analysis (SEO/GA4), specs, scheduling, compliance (Step Up off-peak price never public). Sign "— PA".` },
+  PM: { label: "PM",    system: `You are the PM agent — sprint/project management. ${SHARED} Focus: sprint coordination, MoSCoW priorities (P0→P3), blockers, keeping the board (220364812) current.` },
+  PA: { label: "PA",    system: `You are the PA agent — assistant & ops support. ${SHARED} Focus: briefs, report analysis (SEO/GA4), specs, scheduling, compliance (Step Up off-peak price never public).` },
 };
-const DEFAULT = { label: "ethera-agents", system: `You are ethera-agents, the team ops assistant. ${SHARED} Sign "— ethera-agents".` };
+const DEFAULT = { label: "ethera-agents", system: `You are ethera-agents, the team ops assistant. ${SHARED}` };
 
 const TOOLS = [
-  { name: "confluence_search", description: "Search pages in the LO Confluence space by text.", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-  { name: "confluence_read_page", description: "Read a Confluence page's text by id.", input_schema: { type: "object", properties: { page_id: { type: "string" } }, required: ["page_id"] } },
+  { name: "confluence_search",      description: "Search pages in the LO Confluence space by text.", input_schema: { type: "object", properties: { query:   { type: "string" } }, required: ["query"]   } },
+  { name: "confluence_read_page",   description: "Read a Confluence page's text by id.",             input_schema: { type: "object", properties: { page_id: { type: "string" } }, required: ["page_id"] } },
   { name: "confluence_create_page", description: "Create a new page in the LO space (content_html = Confluence storage HTML).", input_schema: { type: "object", properties: { title: { type: "string" }, content_html: { type: "string" }, parent_id: { type: "string" } }, required: ["title", "content_html"] } },
-  { name: "confluence_update_page", description: "Replace a page's body by id (reversible via history).", input_schema: { type: "object", properties: { page_id: { type: "string" }, content_html: { type: "string" } }, required: ["page_id", "content_html"] } },
+  { name: "confluence_update_page", description: "Replace a page's body by id (reversible via history).",                       input_schema: { type: "object", properties: { page_id: { type: "string" }, content_html: { type: "string" } },                          required: ["page_id", "content_html"] } },
 ];
 
 async function conf(path, opts = {}) {
@@ -87,25 +92,104 @@ async function think(system, prompt) {
   return `I couldn't finish within my tool budget.${lastError ? ` Last tool error: ${lastError}` : " No tool errors logged — try a narrower request."}`;
 }
 
-function pickRole(text) { const t = (text || "").toUpperCase(); if (t.includes("[PM]")) return ROLES.PM; if (t.includes("[PA]")) return ROLES.PA; return DEFAULT; }
+function pickRole(text) {
+  const t = (text || "").toUpperCase();
+  if (t.includes("[PM]")) return { ...ROLES.PM, key: "PM" };
+  if (t.includes("[PA]")) return { ...ROLES.PA, key: "PA" };
+  return { ...DEFAULT, key: "AGENT" };
+}
 
+// ─── Vercel raw-body read for Slack signature verification ─────────────────
+// Vercel's Node runtime parses JSON bodies before handing them to us. The
+// Slack signature is computed over the RAW request body, so we need to read
+// the stream directly before parsing. `req.body` (parsed JSON) is also
+// available — we read both.
+async function readRawBody(req) {
+  if (req.rawBody) return req.rawBody.toString("utf8");
+  const chunks = [];
+  for await (const chunk of req) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+// Constant-time HMAC compare. Returns false on any length / hash mismatch.
+function verifySlackSignature({ rawBody, timestamp, signature, secret }) {
+  if (!secret) return false;                       // misconfigured deploy
+  if (!timestamp || !signature) return false;
+  // Reject anything older than 5 minutes (replay window per Slack docs).
+  const fiveMinutes = 5 * 60;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - Number(timestamp)) > fiveMinutes) return false;
+  const base = `v0:${timestamp}:${rawBody}`;
+  const expected = "v0=" + crypto.createHmac("sha256", secret).update(base).digest("hex");
+  if (expected.length !== signature.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(signature, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+// ─── Handler ───────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  const body = req.body || {};
-  if (body.type === "url_verification") return res.status(200).json({ challenge: body.challenge });
+  // 1. Read raw body BEFORE parsing — needed for signature verify.
+  let rawBody;
+  try { rawBody = await readRawBody(req); }
+  catch { return res.status(400).end(); }
+
+  let body;
+  try { body = rawBody ? JSON.parse(rawBody) : {}; } catch { return res.status(400).end(); }
+
+  // 2. URL verification (no signature yet — Slack ping during app config).
+  if (body.type === "url_verification") {
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  // 3. Slack signature verify on every other request.
+  const ok = verifySlackSignature({
+    rawBody,
+    timestamp: req.headers["x-slack-request-timestamp"],
+    signature: req.headers["x-slack-signature"],
+    secret:    SLACK_SIGNING_SECRET,
+  });
+  if (!ok) {
+    console.warn("[ethera-agents] slack signature rejected");
+    return res.status(401).json({ error: "invalid-signature" });
+  }
+
+  // 4. Slack retry-storm guard.
   if (req.headers["x-slack-retry-num"]) return res.status(200).end();
 
   const event = body.event || {};
   const isOwn = event.bot_id || event.user === BOT_USER_ID;
   const mentionsBot = event.text && event.text.includes(`<@${BOT_USER_ID}>`);
-  if (event.type === "message" && !isOwn && mentionsBot) {
+
+  // 5. Per CSO DOD: triggered by Ron only. Any other user is ignored
+  //    silently (still returns 200 so Slack doesn't retry).
+  const triggeredByRon = RON_USER_ID && event.user === RON_USER_ID;
+  if (event.type === "message" && !isOwn && mentionsBot && triggeredByRon) {
     const role = pickRole(event.text);
-    const prompt = event.text.replace(new RegExp(`<@${BOT_USER_ID}>`, "g"), "").replace(/\[(PM|PA)\]/gi, "").trim();
+    const prompt = event.text
+      .replace(new RegExp(`<@${BOT_USER_ID}>`, "g"), "")
+      .replace(/\[(PM|PA)\]/gi, "")
+      .trim();
     const reply = await think(role.system, prompt);
-    await postToSlack(event.channel, event.ts, `*${role.label}*\n${reply}`);
+    // CSO protocol: TOP-LEVEL posts only, never in thread. Output tagged
+    // [ROLE] -> [Ron]: <topic> on the first line so threads-of-threads
+    // can't accidentally form.
+    const text = `[${role.key}] -> [Ron]: ${reply}`;
+    await postToSlack(event.channel, text);
+  } else if (event.type === "message" && !isOwn && mentionsBot && !triggeredByRon) {
+    console.warn(`[ethera-agents] mention from non-Ron user ${event.user} ignored (DOD: Ron-only trigger).`);
   }
   return res.status(200).end();
 }
 
-async function postToSlack(channel, thread_ts, text) {
-  await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }, body: JSON.stringify({ channel, thread_ts, text }) });
+async function postToSlack(channel, text) {
+  // Per CSO coordination-reset protocol (20:11 BST 2026-06-16): all
+  // coordination is TOP-LEVEL. We deliberately do NOT pass thread_ts.
+  await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    body: JSON.stringify({ channel, text }),
+  });
 }
