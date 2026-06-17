@@ -4,7 +4,7 @@ import { loadCursor, saveCursor, fetchChannelHistory, formatHistoryForPrompt } f
 
 // ─── Identity + scope ──────────────────────────────────────────────────────
 const BOT_USER_ID = process.env.BOT_SLACK_USER_ID || "U0B8R5AQRTL";
-const RON_USER_ID = process.env.RON_SLACK_USER_ID || "";           // Step 1: trigger gate
+const RON_USER_ID = process.env.RON_SLACK_USER_ID || "U0B29L66W59"; // Ron Bonnici — non-secret, also in Confluence persona briefs. Env var optional override.
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || ""; // Step 1: signature verify
 const SPACE_KEY = "LLO"; // Lucida Origem
 
