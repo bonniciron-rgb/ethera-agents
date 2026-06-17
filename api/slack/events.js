@@ -195,15 +195,19 @@ export default async function handler(req, res) {
   const event = body.event || {};
   const isOwn = event.bot_id || event.user === BOT_USER_ID;
   const mentionsBot = event.text && event.text.includes(`<@${BOT_USER_ID}>`);
+  // Coordination-protocol trigger: any Ron post that opens with a role tag
+  // ([PM]/[PA]/[MK]/[DS]) is an explicit address to the bot. No @-mention
+  // needed — top-level role-tagged messages are the protocol.
+  const hasRoleTag = event.text && /\[(PM|PA|MK|DS)\]/i.test(event.text);
 
   // 5. Per CSO DOD: triggered by Ron only. Any other user is ignored
   //    silently (still returns 200 so Slack doesn't retry).
   const triggeredByRon = RON_USER_ID && event.user === RON_USER_ID;
-  if (event.type === "message" && !isOwn && mentionsBot && triggeredByRon) {
+  if (event.type === "message" && !isOwn && triggeredByRon && (mentionsBot || hasRoleTag)) {
     const role = pickRole(event.text);
     const ask = event.text
       .replace(new RegExp(`<@${BOT_USER_ID}>`, "g"), "")
-      .replace(/\[(PM|PA)\]/gi, "")
+      .replace(/\[(PM|PA|MK|DS)\]/gi, "")
       .trim();
 
     // Ground on #panpm history since last cursor (fail-open).
