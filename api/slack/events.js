@@ -13,6 +13,13 @@ const anthropic = new Anthropic();
 const CONF = process.env.CONFLUENCE_BASE_URL; // https://ronbonnici.atlassian.net/wiki
 const AUTH = "Basic " + Buffer.from(`${process.env.CONFLUENCE_EMAIL}:${process.env.CONFLUENCE_API_TOKEN}`).toString("base64");
 
+// Surface misconfiguration at cold start instead of failing silently on the
+// first tool call. Logged once per container; doesn't throw — the bot can
+// still reply on Slack-only requests.
+if (!CONF || !process.env.CONFLUENCE_EMAIL || !process.env.CONFLUENCE_API_TOKEN) {
+  console.warn("[ethera-agents] Confluence env incomplete — confluence_* tools and persona briefs will fail.");
+}
+
 const SHARED = `You operate in the Lucida Origem / OnPoint team Slack (#panpm). Brands: Step Up Idiomas, CasaMinder, Ethera. You can read and write the Lucida Origem (LO) Confluence space via your confluence_* tools — the live sprint/strategy board is page 220364812 and the 30-day strategy is page 223608837. Read the board for current context before answering when relevant. Reply concisely, Slack-style. Coordination protocol: post TOP-LEVEL only (never threads), tag every reply as "[ROLE] -> [TO]: <topic>". You may draft, plan, analyse, and update LO Confluence (reversible). Never claim to have published externally, deployed to prod, sent client messages, or spent money — those need Ron's ✅. One step at a time.`;
 
 const ROLES = {
@@ -66,7 +73,10 @@ async function runTool(name, input) {
 async function think(system, prompt) {
   const messages = [{ role: "user", content: prompt || "Introduce yourself to the team." }];
   let lastError = null;
-  const MAX = 10;
+  // Per-persona iteration cap. Bumped from 10 → 20: research/MK/DS tasks
+  // routinely chain search → read several pages → draft, which blows
+  // through 10. Still bounded so a runaway loop can't burn the budget.
+  const MAX = 20;
   for (let i = 0; i < MAX; i++) {
     const r = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 1500, system, tools: TOOLS, messages });
     const toolUses = r.content.filter((c) => c.type === "tool_use");
